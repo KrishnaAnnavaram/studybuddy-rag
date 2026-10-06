@@ -1,0 +1,37 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "studybuddy-rag"
+version = "0.1.0"
+description = "Voice-enabled RAG tutor with subject routing and a learning dashboard"
+readme = "README.md"
+license = { text = "MIT" }
+authors = [{ name = "Krishna Annavaram" }]
+requires-python = ">=3.10"
+# The core (routing, retrieval, auth, analytics, offline demo) is pure standard library.
+dependencies = []
+
+[project.optional-dependencies]
+ui = ["streamlit>=1.40"]
+embeddings = ["sentence-transformers>=3.0"]
+pdf = ["pymupdf>=1.24"]
+dev = ["pytest>=8", "ruff"]
+all = ["streamlit>=1.40", "sentence-transformers>=3.0", "pymupdf>=1.24"]
+
+[project.scripts]
+studybuddy = "studybuddy_rag.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+studybuddy_rag = ["data/corpus/*.md", "data/*.jsonl", "prompts/*.txt"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+
+[tool.ruff]
+line-length = 110
