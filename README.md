@@ -1,147 +1,732 @@
-# studybuddy-rag
+<div align="center">
 
-A voice-enabled study tutor that routes each question to a subject with a strict classifier, answers from the study material with numbered citations, and keeps every student's history and dashboard private to them.
+# studybuddy-rag — Subject-Routed Study Tutor With Cited Answers
 
-[![CI](https://github.com/KrishnaAnnavaram/studybuddy-rag/actions/workflows/ci.yml/badge.svg)](https://github.com/KrishnaAnnavaram/studybuddy-rag/actions/workflows/ci.yml)
+**studybuddy-rag is a study tutor for school students that gives answers from the study material with numbered citations. It takes a text or voice question through these steps to a cited answer:**
 
-## Features
+`authenticate` → `route` → `retrieve` → `answer` → `check citations` → `record`.
 
-- **Strict subject routing.** A dedicated classification call returns JSON over a closed label set (`arts`, `mathematics`, `science`, `general`). Replies are validated, and anything else (prose, unknown labels, missing fields, out-of-range confidence) is rejected. A rejected reply falls back to an embedding nearest-centroid classifier, so retrieval never silently stops.
-- **Real retrieval.** Section-aware, sentence-aligned chunks with overlap. The splitter doesn't break `3.14`, `e.g.` or `Dr.`. Hybrid search (dense cosine + BM25) returns the top-k chunks, and the index is persisted in SQLite and built once.
-- **Answers with citations.** Sources are numbered in the prompt, and `[n]` citations are checked against them. Citations to sources that don't exist are removed. An answer with no valid citation is labelled *not grounded in the study material*.
-- **Secure accounts.** Salted scrypt password hashes, opaque session tokens (only their SHA-256 is stored) with expiry and logout, a session guard on every call, and `student` / `instructor` roles.
-- **Privacy by design.** Students see only their own grades and questions. Course averages appear only when at least *k* students contribute, and the instructor view shows aggregates only, with small groups suppressed. Query logs have a retention policy (`studybuddy purge-logs`).
-- **Optional voice input.** The question is recorded in the browser (`st.audio_input`) and transcribed by a `SpeechToText` provider, so voice works in a deployed app.
-- **Pluggable providers.** Gemini, any OpenAI-compatible endpoint (OpenAI, Ollama, vLLM) and sentence-transformers are selected by environment variables. Deterministic fakes run everything offline.
-- **Evaluation harness.** Router accuracy and confusion matrix, retrieval recall@k and MRR, and the rate of answers with a valid citation, all on a labelled question set.
+![Subjects](https://img.shields.io/badge/Subjects-3_%2B_general-1F3864?style=for-the-badge)
+![CLI commands](https://img.shields.io/badge/CLI_commands-6-2E5FD9?style=for-the-badge)
+![Eval set](https://img.shields.io/badge/Eval_set-23_questions-6E86E8?style=for-the-badge)
+![Tests](https://img.shields.io/badge/Tests-55_passing-3DA35B?style=for-the-badge)
+![Offline demo](https://img.shields.io/badge/Offline_demo-Yes-F5C542?style=for-the-badge)
+![License](https://img.shields.io/badge/License-MIT-A0399B?style=for-the-badge)
 
-## Architecture
+![Python](https://img.shields.io/badge/Python-3.10%2B-3776AB?style=flat-square&logo=python&logoColor=white)
+![SQLite](https://img.shields.io/badge/SQLite-users_%2B_index-003B57?style=flat-square&logo=sqlite&logoColor=white)
+![Streamlit](https://img.shields.io/badge/Streamlit-UI-FF4B4B?style=flat-square&logo=streamlit&logoColor=white)
+![Gemini](https://img.shields.io/badge/Gemini-optional-8E75B2?style=flat-square&logo=googlegemini&logoColor=white)
+![OpenAI](https://img.shields.io/badge/OpenAI_compatible-optional-412991?style=flat-square&logo=openai&logoColor=white)
+![pytest](https://img.shields.io/badge/pytest-55_tests-0A9EDC?style=flat-square&logo=pytest&logoColor=white)
+![Docs](https://img.shields.io/badge/Docs-ASD--STE100-5D6D7E?style=flat-square)
+
+**[Summary](#1-summary)** ·
+**[Workflow](#4-the-end-to-end-workflow)** ·
+**[Run it](#16-how-to-run-studybuddy-rag)** ·
+**[Configuration](#164-environment-variables)** ·
+**[Known problems](#19-known-problems)** ·
+**[Glossary](#21-glossary)**
+
+</div>
+
+> [!NOTE]
+> This README uses ASD-STE100 Simplified Technical English. The writing rules and the project
+> vocabulary are in [`docs/ste-style-guide.md`](docs/ste-style-guide.md). Each term in the
+> [Glossary](#21-glossary) has only one meaning.
+
+---
+
+studybuddy-rag is a retrieval-augmented tutor for arts, mathematics and science.
+A strict classifier routes each question to one subject, and a hybrid index retrieves the top chunks of the study material.
+The answer cites its sources as `[n]`, and the code removes each citation that points to no source.
+Each student sees only the data of that student.
+The core uses only the Python standard library, so the full demo runs offline with deterministic fakes.
+
+This README is the **one location that explains all of studybuddy-rag**. It gives these topics:
+
+- the general design
+- each component and its procedure, step by step
+- the decision rules
+- the data map
+- the runbook
+- the validation results and the known problems
+
+| If you are… | Read |
+|---|---|
+| A manager or reviewer | [1](#1-summary), [3](#3-design-rules), [4](#4-the-end-to-end-workflow), [18](#18-validation-results), [20](#20-key-points) |
+| A developer who joins the project | All sections, in sequence. Keep [16](#16-how-to-run-studybuddy-rag) and [19](#19-known-problems) open while you work |
+| An operator who runs studybuddy-rag | [16](#16-how-to-run-studybuddy-rag), then the section for the component that you use |
+
+---
+
+## Table of contents
+
+1. 🧭 [Summary](#1-summary)
+2. 🏗️ [How studybuddy-rag is built](#2-how-studybuddy-rag-is-built)
+   - 2.1 [Components](#21-components)
+   - 2.2 [System context](#22-system-context)
+   - 2.3 [Repository layout](#23-repository-layout)
+3. 🛡️ [Design rules](#3-design-rules)
+4. 🔄 [The end-to-end workflow](#4-the-end-to-end-workflow)
+   - 4.1 [Full flow](#41-full-flow)
+   - 4.2 [The life cycle of one question](#42-the-life-cycle-of-one-question)
+5. 🔵 [Ingestion and chunks](#5-ingestion-and-chunks)
+6. 🟢 [The hybrid index](#6-the-hybrid-index)
+7. 🟣 [The subject router](#7-the-subject-router)
+8. 🟠 [The tutor and the citation check](#8-the-tutor-and-the-citation-check)
+9. 🔐 [Accounts and sessions](#9-accounts-and-sessions)
+10. 📊 [Progress analytics](#10-progress-analytics)
+11. 🎙️ [Providers and voice input](#11-providers-and-voice-input)
+12. 🖥️ [Service, CLI and user interface](#12-service-cli-and-user-interface)
+13. 🧪 [The evaluation harness](#13-the-evaluation-harness)
+14. ⚖️ [The safety and privacy model](#14-the-safety-and-privacy-model)
+15. 🗂️ [Data and file map](#15-data-and-file-map)
+16. ▶️ [How to run studybuddy-rag](#16-how-to-run-studybuddy-rag)
+    - 16.1 [Prerequisites](#161-prerequisites) · 16.2 [Installation](#162-installation) · 16.3 [Run studybuddy-rag](#163-run-studybuddy-rag) · 16.4 [Environment variables](#164-environment-variables)
+17. 🧩 [How to extend studybuddy-rag](#17-how-to-extend-studybuddy-rag)
+18. ✅ [Validation results](#18-validation-results)
+19. ⚠️ [Known problems](#19-known-problems)
+20. 📌 [Key points](#20-key-points)
+21. 📖 [Glossary](#21-glossary)
+22. 📄 [License](#22-license)
+
+---
+
+## 1. Summary
+
+**The problem.** A student asks a question in free text or by voice, and the tutor must give an answer from the study material. These questions are difficult:
+
+- Which subject does the question belong to, and what happens when the classifier gives a bad reply?
+- Which parts of the study material contain the answer?
+- How does the student know that the answer comes from the study material?
+- How does the tutor keep the grades and the questions of one student away from other students?
+
+studybuddy-rag gives each of these questions its own component. The service connects the components, and each call starts with a session check.
+
+| Item | Value |
+|---|---|
+| Input | A question as text, or as audio that the browser records |
+| Output | An answer with numbered citations, the route decision and notes. A dashboard for each student |
+| Components | **16** modules: settings, subjects, text tools, ingestion, index, router, tutor, auth, database, analytics, seed, service, evaluation, CLI, Streamlit UI, providers |
+| Subjects | `arts`, `mathematics`, `science` (with study material) and `general` (no study material) |
+| Providers | LLM: Gemini or any OpenAI-compatible server. Embedder: `sentence-transformers`. Speech: OpenAI Whisper. All optional |
+| Offline mode | `FakeLLM`, the `hashing` embedder and `FakeSpeechToText`. No key and no network |
+| Safety | Scrypt password hashes, a session check on each call, data for each student only, k-anonymous aggregates |
+| Tests | **55** unit tests (`pytest`) |
+
+```mermaid
+flowchart LR
+    IN["Question (text or voice)"] --> A["Authenticate"] --> B["Route to a subject"] --> C["Retrieve top-k chunks"] --> D["Answer with [n] citations"] --> E["Check citations"] --> F["Record in query_log"] --> OUT["Cited answer and dashboard"]
+```
+
+---
+
+## 2. How studybuddy-rag is built
+
+### 2.1 Components
+
+| Component | Module | Purpose |
+|---|---|---|
+| Settings | `src/studybuddy_rag/config.py` | Read and validate the environment variables. Load a local `.env` file |
+| Subjects | `src/studybuddy_rag/subjects.py` | The closed label set and its strict parser |
+| Text tools | `src/studybuddy_rag/text.py` | Tokens, stems, stop words and a sentence splitter that keeps `3.14` and `e.g.` |
+| Ingestion | `src/studybuddy_rag/ingest.py` | Parse Markdown documents and pack sentences into chunks |
+| Hybrid index | `src/studybuddy_rag/index.py` | Dense cosine plus BM25 search, subject filter, SQLite persistence |
+| Subject router | `src/studybuddy_rag/router.py` | `LLMRouter` with a JSON schema, then the `CentroidRouter` fallback |
+| Tutor | `src/studybuddy_rag/tutor.py` | Greeting check, route, retrieve, answer, citation check |
+| Auth service | `src/studybuddy_rag/auth.py` | Scrypt hashes, session tokens with expiry, roles |
+| Database | `src/studybuddy_rag/db.py` | SQLite schema and row access |
+| Analytics | `src/studybuddy_rag/analytics.py` | Student dashboard, instructor overview, grade summary, retention |
+| Seed | `src/studybuddy_rag/seed.py` | Synthetic demo users, courses and grades |
+| Service | `src/studybuddy_rag/service.py` | The `StudyBuddy` facade. Each call takes a session token |
+| Evaluation | `src/studybuddy_rag/evaluate.py` | Router accuracy, recall@k, MRR and citation rate |
+| CLI | `src/studybuddy_rag/cli.py` | The `studybuddy` command with 6 subcommands |
+| Streamlit UI | `src/studybuddy_rag/app/streamlit_app.py` | Login, chat, dashboard and class overview pages |
+| Providers | `src/studybuddy_rag/providers/` | LLM, embedder and speech interfaces, HTTP adapters and offline fakes |
+
+### 2.2 System context
 
 ```mermaid
 flowchart TB
-  subgraph ingest["offline ingestion (studybuddy ingest)"]
-    MD["corpus: Markdown or PDF with subject metadata"] --> CH["sentence-aware chunks with overlap"]
-    CH --> IDX["HybridIndex: dense vectors + BM25, persisted in SQLite"]
-  end
-  subgraph core["StudyBuddy service"]
-    AUTH["AuthService: scrypt hashes, session tokens, expiry, roles"]
-    VOICE["SpeechToText (browser-recorded audio)"]
-    ROUTE["LLMRouter: JSON enum, validated, then CentroidRouter fallback"]
-    RET["top-k retrieval filtered by subject, whole-corpus fallback"]
-    ANS["LLM answer with numbered sources, citations validated"]
-    LOG["query_log scoped to the user, retention policy"]
-    ANA["analytics: own data only, k-anonymous aggregates"]
-  end
-  subgraph ui["Streamlit UI and CLI"]
-    CHAT["chat: text or voice"]
-    DASH["my dashboard / class overview"]
-  end
-  CHAT --> AUTH
-  CHAT --> VOICE --> ROUTE
-  AUTH --> ROUTE --> RET --> ANS --> LOG --> ANA --> DASH
-  IDX --> RET
-  IDX --> ROUTE
+    S["Student"] --> UI["Streamlit UI or studybuddy CLI"]
+    T["Instructor"] --> UI
+    UI --> SVC["StudyBuddy service"]
+    SVC --> DB["SQLite file (users, sessions, grades, query_log, chunks)"]
+    SVC --> LLM["LLM provider: fake, Gemini or OpenAI-compatible (optional)"]
+    SVC --> EMB["Embedder: hashing or sentence-transformers (optional)"]
+    SVC --> STT["Speech provider: none, fake or OpenAI Whisper (optional)"]
+    CORP["Corpus folder (Markdown with a subject header)"] --> SVC
 ```
 
-## Quickstart
+### 2.3 Repository layout
 
-```bash
-python -m venv .venv && . .venv/Scripts/activate     # Windows; use .venv/bin/activate on Linux/macOS
-pip install -e ".[dev,ui]"                          # core is pure stdlib; ui adds Streamlit
-cp .env.example .env                                # optional: leave values empty for offline demo mode
-studybuddy init                                     # demo DB, synthetic users, retrieval index
-studybuddy ask -u student_a "How do I add 1/3 and 1/4?"
-studybuddy eval                                     # router accuracy, recall@k, citation rate
-studybuddy ui                                       # Streamlit app
+```
+studybuddy-rag/
+├── .github/workflows/ci.yml     # CI: Python 3.11, pip install -e ".[dev]", pytest -q
+├── .env.example                 # every environment variable, all values empty
+├── pyproject.toml               # package, extras (ui, embeddings, pdf, dev, all), studybuddy script
+├── src/studybuddy_rag/
+│   ├── config.py  subjects.py  text.py     # settings, label set, text tools
+│   ├── ingest.py  index.py                 # chunks and the hybrid index
+│   ├── router.py  tutor.py                 # routing and cited answers
+│   ├── auth.py  db.py  seed.py             # accounts, sessions, schema, demo data
+│   ├── analytics.py  service.py            # dashboards and the facade
+│   ├── evaluate.py  cli.py                 # evaluation harness and command line
+│   ├── app/streamlit_app.py                # user interface
+│   ├── providers/                          # base, factory, fakes, http, llm, embeddings, speech
+│   └── data/
+│       ├── corpus/*.md                     # 5 sample documents (CC BY 4.0), 22 chunks
+│       └── eval_set.jsonl                  # 23 labelled questions
+└── tests/                                  # 55 tests, no network, no API keys
 ```
 
-`studybuddy init` creates the synthetic accounts `student_a` to `student_d` and `instructor_demo`. Their password comes from `STUDYBUDDY_DEMO_PASSWORD` or `--password`, or it's generated randomly and printed once. No password is stored in the repository.
+---
 
-To use real models, set e.g. `STUDYBUDDY_LLM_PROVIDER=gemini` and `GEMINI_API_KEY`, and optionally `STUDYBUDDY_EMBEDDING_PROVIDER=sentence-transformers` (`pip install -e ".[embeddings]"`). Then rebuild the index with `studybuddy ingest`, because the index records which embedder built it and refuses to load with a different one.
+## 3. Design rules
 
-## Configuration
+### 3.1 The router narrows retrieval and never disables it
+The tutor first searches the routed subject. If no chunk is above `STUDYBUDDY_MIN_SCORE`, the tutor searches all subjects and adds a note. A `general` question also gets a corpus search, with the stricter threshold `0.25`. This logic is in `Tutor.retrieve` in `tutor.py`.
 
-| Variable | Default | Purpose |
+### 3.2 The classifier reply is strict
+`LLMRouter` makes a dedicated classification call with `ROUTER_SCHEMA`. The `subject` field is an enum of the four labels. `parse_route_output` rejects prose, unknown labels, absent fields, extra fields and a confidence outside 0 to 1. After a rejected reply, the router tries one more time and then uses `CentroidRouter`.
+
+### 3.3 Each claim cites a source that exists
+The answer prompt numbers the sources `[1]` to `[k]`. `extract_citations` splits the citations into valid and invalid numbers. The tutor removes each invalid citation from the text. An answer with no valid citation has the kind `ungrounded`, and the CLI and the UI tell the student.
+
+### 3.4 Each call has a session token
+`StudyBuddy` is the only entry point for the CLI and the UI. Each method calls `AuthService.authenticate(token)` before it does work. `ask_voice` checks the session before it sends audio to the speech provider.
+
+### 3.5 Each student sees only the data of that student
+The analytics functions read rows only for `principal.user_id`. The `_grades_for_user` and `_queries_for_user` helpers in `db.py` take the user ID from the authenticated principal, not from the request. The optional LLM summary gets only the grades of the caller.
+
+### 3.6 Shared numbers are k-anonymous
+A course average is visible only when at least `STUDYBUDDY_K_ANONYMITY` students have a grade in that course. The instructor view hides each course with fewer than k grades. It also hides each subject that fewer than k students asked about.
+
+### 3.7 The default mode is offline
+Each provider has a deterministic fake. With no environment variables, the app, the CLI and the tests use `FakeLLM` and the `hashing` embedder. The core package has no third-party dependencies.
+
+### 3.8 No secret is in the repository
+`Settings` hides the API keys from `repr`. Demo passwords come from `--password`, `STUDYBUDDY_DEMO_PASSWORD` or a random value that `init` prints one time. Git ignores `.env`, `*.db` and `/data/`.
+
+---
+
+## 4. The end-to-end workflow
+
+### 4.1 Full flow
+
+```mermaid
+flowchart TB
+    subgraph OFF["Offline: studybuddy init or studybuddy ingest"]
+        MD["Corpus: Markdown files with title and subject"] --> CH["Sentence-aligned chunks with 1-sentence overlap"]
+        CH --> IDX["HybridIndex: vectors and BM25, saved in SQLite"]
+    end
+    subgraph ON["Online: StudyBuddy.ask or StudyBuddy.ask_voice"]
+        AUTH["AuthService.authenticate"] --> GREET{"Greeting?"}
+        GREET -- "yes" --> HELLO["Fixed greeting, no LLM call, not recorded"]
+        GREET -- "no" --> ROUTE["LLMRouter, then CentroidRouter fallback"]
+        ROUTE --> RET["Search the subject, then all subjects"]
+        RET --> HITS{"Any chunk?"}
+        HITS -- "no" --> GEN["General LLM answer, kind ungrounded"]
+        HITS -- "yes" --> ANS["LLM answer with numbered sources"]
+        ANS --> CHK["Remove invalid [n], set grounded or ungrounded"]
+        GEN --> LOG["Record in query_log"]
+        CHK --> LOG
+    end
+    IDX --> RET
+    IDX --> ROUTE
+    LOG --> DASH["Student dashboard and instructor overview"]
+```
+
+### 4.2 The life cycle of one question
+
+1. The student sends a question in the UI, or with `studybuddy ask`.
+2. If the question is audio, the service authenticates the session and transcribes the audio.
+3. The service authenticates the session token.
+4. The tutor normalises the white space. An empty question causes a `ValueError`.
+5. If the question is a greeting, the tutor returns a fixed greeting and stops here.
+6. The router gives a route decision: a subject, a confidence and a method.
+7. The tutor retrieves up to `STUDYBUDDY_TOP_K` chunks.
+8. If no chunk is found, the LLM gives a general answer with the kind `ungrounded`.
+9. Otherwise, the LLM gets the numbered sources and gives an answer with `[n]` citations.
+10. The tutor removes invalid citations and sets the kind to `grounded` or `ungrounded`.
+11. The service records the question, the subject, the method, the answer and the citations in `query_log`.
+12. The UI or the CLI shows the answer, the subject, the cited sources and the notes.
+
+---
+
+## 5. Ingestion and chunks
+
+**Purpose.** Change the study material into small, overlapping chunks that keep their title, section and subject.
+
+| Input | Output |
+|---|---|
+| A folder of `.md` files (`STUDYBUDDY_CORPUS_DIR`). Each file starts with a `---` header with `title`, `subject` and `license` | A list of `Chunk` objects with `chunk_id`, `source_id`, `title`, `subject`, `section`, `text`, `page` and `position` |
+
+**Procedure**
+
+1. `load_corpus` reads each `*.md` file in the folder in name order.
+2. `parse_markdown` reads the header. A file without `subject` causes an error.
+3. A `subject` of `general` causes an error, because `general` has no study material.
+4. Each `#` heading starts a new section. Text before the first heading goes into the section `Introduction`.
+5. `split_sentences` splits each section into sentences.
+6. `chunk_document` packs whole sentences into chunks of at most 120 words.
+7. Two chunks next to each other in a section share one sentence of overlap.
+8. Each chunk gets the ID `<source_id>:<position>:<8 hex characters of SHA-1>`.
+
+**Rules**
+
+- A chunk never crosses a section boundary.
+- A sentence with more than 120 words becomes one chunk.
+- The splitter does not split after a decimal point (`3.14`), after a known abbreviation (`e.g.`, `Dr.`, `Fig.`) or after a single initial.
+- `max_words` must be 10 or more. `overlap_sentences` must be 0 or more.
+- The bundled corpus has 5 documents (1,319 words) and gives 22 chunks.
+- `parse_pdf` reads a PDF page by page with the `pdf` extra. `load_corpus` does not call it. See [Known problems](#19-known-problems).
+
+---
+
+## 6. The hybrid index
+
+**Purpose.** Find the top-k chunks for a question, with an optional subject filter.
+
+| Input | Output |
+|---|---|
+| A question, `k`, an optional subject and `min_score` | Up to `k` `ScoredChunk` objects, sorted by score (high to low) |
+
+**Procedure**
+
+1. `HybridIndex.build` embeds the text `"<section>. <text>"` of each chunk one time.
+2. The index also builds BM25 statistics (`k1 = 1.5`, `b = 0.75`) on the stemmed content words.
+3. `search` keeps only the chunks of the subject, if a subject is given.
+4. It calculates the dense score: the cosine of the question vector and the chunk vector.
+5. It calculates the sparse score: BM25, divided by the highest BM25 score of the candidates.
+6. It calculates `score = 0.6 × max(dense, 0) + 0.4 × sparse`.
+7. It keeps each chunk with `score >= min_score` and `score > 0`, and returns the top `k`.
+8. `save` writes the tables `chunks` and `index_meta` into the SQLite file, and replaces the old tables.
+
+**Rules**
+
+- `index_meta` records the embedder name, for example `hashing-1024` or `st:all-MiniLM-L6-v2`.
+- `HybridIndex.load` refuses an index from a different embedder and tells you to run `studybuddy ingest`.
+- Equal scores sort by `chunk_id`, so the result order is deterministic.
+- `k` must be 1 or more. `dense_weight` must be between 0 and 1.
+
+---
+
+## 7. The subject router
+
+**Purpose.** Give each question exactly one subject from the closed label set.
+
+| Input | Output |
+|---|---|
+| A question | A `RouteDecision`: `subject`, `confidence`, `method` (`llm`, `centroid` or `fallback-default`) and `detail` |
+
+**Procedure**
+
+1. `LLMRouter` sends `Subjects: ...` and `Question: ...` with the system prompt `ROUTER_SYSTEM` and `ROUTER_SCHEMA`.
+2. `parse_route_output` removes a code fence, if there is one, and parses the JSON.
+3. If the reply is valid, the method is `llm`.
+4. If the reply is invalid or the provider fails, the router tries one more time (`retries=1`).
+5. After two failures, `CentroidRouter` routes the question. The `detail` field keeps the rejection reasons.
+6. If there is no fallback router, the subject is `general` and the method is `fallback-default`.
+
+**Rules**
+
+- `Subject.parse` accepts only an exact label. Case and white space at the ends do not matter.
+- The confidence must be a finite number from 0 to 1. A boolean is not a number here.
+- `CentroidRouter` uses the mean vector of the chunks of each subject.
+- If the best cosine similarity is less than `0.08`, `CentroidRouter` returns `general`.
+- The centroid confidence is `min(1, 0.5 + margin)`, where the margin is the difference between the two best similarities.
+
+---
+
+## 8. The tutor and the citation check
+
+**Purpose.** Give an answer from the retrieved chunks and prove each citation against the numbered sources.
+
+| Input | Output |
+|---|---|
+| A question, the route decision and the retrieved chunks | A `TutorAnswer`: `text`, `kind` (`greeting`, `grounded` or `ungrounded`), `route`, `sources`, `cited` and `notes` |
+
+**Procedure**
+
+1. `is_greeting` checks the question against a fixed list (`hi`, `hello`, `good morning`, `thanks`, `bye` and others).
+2. `retrieve` runs the search in the order of [3.1](#31-the-router-narrows-retrieval-and-never-disables-it).
+3. If there is no chunk, the LLM gets `GENERAL_SYSTEM`, and the answer says that it is not from the study material.
+4. `build_answer_prompt` lists each chunk as `[n] (<title> - <section>) <text>`.
+5. The LLM gets `ANSWER_SYSTEM`, which tells it to use only the sources and to cite them.
+6. `extract_citations` finds each `[n]` with one or two digits.
+7. The tutor removes each `[n]` that is not between 1 and the number of sources, and adds a note.
+8. The kind is `grounded` if at least one valid citation remains. Otherwise the kind is `ungrounded`.
+
+**Rules**
+
+- A greeting does not call the LLM and does not go into `query_log`.
+- The citation label is `[n] <title> - <section>`, with `, p. <page>` for a PDF page.
+- A valid citation proves that the source exists. It does not prove that the source supports the claim.
+
+---
+
+## 9. Accounts and sessions
+
+**Purpose.** Control who can use the tutor and which data each user can see.
+
+| Input | Output |
+|---|---|
+| A user name and a password | A `Session` with an opaque token, the `Principal` and the expiry time |
+
+**Procedure**
+
+1. `register` makes the user name lower case and checks the role (`student` or `instructor`).
+2. `hash_password` refuses a password with fewer than 8 characters.
+3. `hash_password` stores `scrypt$N$r$p$salt$hash` with `N = 2^14`, `r = 8`, `p = 1` and a 16-byte random salt.
+4. `login` verifies the password with a constant-time comparison.
+5. `login` makes a random token (`secrets.token_urlsafe(32)`) and stores only its SHA-256 hash.
+6. `authenticate` finds the session by the token hash and checks the expiry time.
+7. If the session is expired, `authenticate` deletes it and raises `AuthError`.
+8. `logout` deletes the session.
+
+**Rules**
+
+- An unknown user name and a wrong password give the same message: `invalid username or password`.
+- For an unknown user name, `login` also verifies against a dummy hash, so both failures take the same time.
+- A session lives for `STUDYBUDDY_SESSION_TTL_MINUTES` minutes (default 60).
+- `require_role` raises `PermissionDenied` when the role is not correct.
+- `seed_demo` makes `student_a` to `student_d` and `instructor_demo` with one shared password, 4 courses and random grades (seed 7). It does not change users that exist.
+
+---
+
+## 10. Progress analytics
+
+**Purpose.** Show each student the progress of that student, and show the instructor aggregates only.
+
+| Input | Output |
+|---|---|
+| The authenticated `Principal` and k | `StudentDashboard`, `InstructorOverview` or a grade summary text |
+
+**Procedure**
+
+1. `student_dashboard` reads the grades and the last 200 questions of the principal.
+2. It calculates the grade point average (A=4, B=3, C=2, D=1, F=0), the strongest courses and the weakest courses.
+3. It adds the course average only for courses of the student with at least k grades.
+4. It counts the questions by subject, the grounded rate and the 15 most frequent words with more than 2 letters.
+5. It keeps the 10 most recent questions.
+6. `instructor_overview` checks the `instructor` role and counts grades by course and grade.
+7. It hides each course with fewer than k grades, and each subject that fewer than k students asked about.
+8. `grade_summary` makes a text from the grades of the caller. With an LLM, it asks for a JSON `summary`.
+
+**Rules**
+
+- If the LLM summary fails or is empty, `grade_summary` returns the text without the LLM.
+- `purge_old_queries` deletes `query_log` rows older than `STUDYBUDDY_LOG_RETENTION_DAYS`. The value must be 1 or more.
+- The dashboard name is always the display name of the authenticated principal.
+
+---
+
+## 11. Providers and voice input
+
+**Purpose.** Connect the tutor to an LLM, an embedder and a speech-to-text service through small interfaces.
+
+| Interface | Implementations | Selected by |
 |---|---|---|
-| `STUDYBUDDY_DB_PATH` | `data/studybuddy.db` | SQLite file for users, sessions, grades, query log and index |
-| `STUDYBUDDY_CORPUS_DIR` | bundled sample corpus | Folder of `.md` documents with a `subject:` header |
-| `STUDYBUDDY_LLM_PROVIDER` | `fake` | `fake`, `gemini` or `openai` (any OpenAI-compatible server) |
-| `STUDYBUDDY_LLM_MODEL` | `gemini-2.5-flash` / `gpt-4o-mini` | Model id, never hard-coded |
-| `STUDYBUDDY_LLM_BASE_URL` | provider default | e.g. `http://localhost:11434/v1` for Ollama |
-| `STUDYBUDDY_EMBEDDING_PROVIDER` | `hashing` | `hashing` (offline) or `sentence-transformers` |
-| `STUDYBUDDY_EMBEDDING_MODEL` | `all-MiniLM-L6-v2` | sentence-transformers model, loaded once per process |
-| `STUDYBUDDY_SPEECH_PROVIDER` | `none` | `none` (mic hidden), `fake` or `openai` (Whisper-compatible) |
-| `STUDYBUDDY_SPEECH_MODEL` | `whisper-1` | Transcription model id |
-| `STUDYBUDDY_TOP_K` | `4` | Chunks retrieved per question |
-| `STUDYBUDDY_MIN_SCORE` | `0.05` | Minimum hybrid score for a chunk to count |
-| `STUDYBUDDY_SESSION_TTL_MINUTES` | `60` | Session lifetime |
-| `STUDYBUDDY_LOG_RETENTION_DAYS` | `180` | Query-log retention used by `purge-logs` |
-| `STUDYBUDDY_K_ANONYMITY` | `3` | Minimum group size for any shown aggregate |
-| `STUDYBUDDY_DEMO_PASSWORD` | random | Password for the synthetic demo accounts |
-| `GEMINI_API_KEY` | - | Needed for `STUDYBUDDY_LLM_PROVIDER=gemini` |
-| `OPENAI_API_KEY` | - | Needed for the hosted OpenAI endpoint (LLM or speech) |
+| `LLM.complete(prompt, system, json_schema)` | `FakeLLM`, `GeminiLLM`, `OpenAICompatibleLLM`, `ScriptedLLM` (tests) | `STUDYBUDDY_LLM_PROVIDER` |
+| `Embedder.embed(texts)` | `HashingEmbedder` (1,024 dimensions), `SentenceTransformerEmbedder` | `STUDYBUDDY_EMBEDDING_PROVIDER` |
+| `SpeechToText.transcribe(audio, mime_type)` | `FakeSpeechToText`, `OpenAITranscriber` | `STUDYBUDDY_SPEECH_PROVIDER` |
 
-## Project structure
+**Procedure**
 
-```
-src/studybuddy_rag/
-  config.py          Settings from environment variables, tiny .env loader
-  subjects.py        the closed subject label set and its strict parser
-  text.py            tokenisation, stemming, decimal/abbreviation-safe sentence splitting
-  ingest.py          Markdown/PDF parsing and section-aware chunking with overlap
-  index.py           HybridIndex: dense + BM25, subject filter, SQLite persistence
-  router.py          LLMRouter (JSON schema + validation) and CentroidRouter fallback
-  tutor.py           greeting check -> route -> retrieve -> answer -> validate citations
-  auth.py            scrypt hashing, sessions with expiry, roles
-  db.py              SQLite schema and row access
-  analytics.py       student dashboard, instructor aggregates, summary, retention
-  service.py         StudyBuddy facade used by the UI and CLI (every call takes a token)
-  evaluate.py        router accuracy, recall@k, MRR, citation rate
-  seed.py            synthetic demo users and grades
-  cli.py             `studybuddy` command
-  providers/         LLM, embedding and speech interfaces, adapters and offline fakes
-  app/streamlit_app.py  login, chat (text/voice), my dashboard, class overview
-  data/corpus/       small original sample corpus (CC BY 4.0)
-  data/eval_set.jsonl  labelled questions for the evaluation harness
-tests/               pytest suite (no network, no API keys)
-```
+1. `build_llm`, `build_embedder` and `build_speech` in `providers/factory.py` read the `Settings`.
+2. `GeminiLLM` calls `models/<model>:generateContent` with temperature 0 and the header `x-goog-api-key`.
+3. `OpenAICompatibleLLM` calls `<base_url>/chat/completions` with temperature 0 and a strict `json_schema` response format.
+4. `OpenAITranscriber` sends the audio as multipart data to `https://api.openai.com/v1/audio/transcriptions`.
+5. The UI records audio in the browser with `st.audio_input`, and `ask_voice` sends it to the speech provider.
+6. The service records a voice question with `input_mode = voice`.
 
-## How it works
+**Rules**
 
-1. **Ingest.** Each document carries `title` and `subject` metadata. Sections are split into sentences, and the sentences are packed into chunks of about 120 words with a one-sentence overlap that never crosses a section. Chunks are embedded once and stored in SQLite along with the embedder's name.
-2. **Route.** The question goes to a classification-only prompt with a JSON schema whose `subject` is an enum. `parse_route_output` accepts only `{"subject": <label>, "confidence": 0..1}`. After a retry, an invalid reply falls back to the nearest subject centroid of the corpus embeddings.
-3. **Retrieve.** The top-k chunks are searched within the routed subject. If none clears the threshold, the whole corpus is searched, because routing narrows retrieval and never disables it. `general` questions still get a stricter corpus search.
-4. **Answer.** The LLM sees numbered sources and must cite them as `[n]`. Out-of-range citations are stripped. An answer without a valid citation is marked ungrounded, and the UI says so.
-5. **Log and analyse.** The question, subject, route method, answer and cited sources are logged against the authenticated user. Dashboards read only that user's rows. Shared numbers (course averages, instructor charts) are aggregates with groups smaller than *k* suppressed.
+- With a JSON schema, the caller still validates the reply. The code does not trust a provider to obey the schema.
+- `GEMINI_API_KEY` is necessary for `gemini`. `OPENAI_API_KEY` is necessary only when the host is `api.openai.com`.
+- A local OpenAI-compatible server (for example Ollama at `http://localhost:11434/v1`) needs no key.
+- `SentenceTransformerEmbedder` loads the model one time for each process.
+- The HTTP helper uses only `urllib`. An HTTP error or a bad response causes `ProviderError`.
+- If `STUDYBUDDY_SPEECH_PROVIDER` is `none`, the UI hides the microphone and `ask_voice` raises `VoiceDisabled`.
 
-On the bundled evaluation set (23 questions, offline fakes) the router scores 0.96 accuracy with the fake LLM (0.87 with the centroid classifier alone), with recall@4 of 1.00, MRR of 1.00, and a valid citation on 100% of answers. These numbers only show that the pipeline is wired correctly, not real-world quality.
+---
 
-## Testing
+## 12. Service, CLI and user interface
+
+**Purpose.** Give one entry point for all user actions, and two front ends on it.
+
+| Input | Output |
+|---|---|
+| `Settings` and a session token | Answers, dashboards and command output |
+
+**Procedure**
+
+1. `build_app` opens the database and loads the saved index from the same SQLite file.
+2. If the index is absent, empty or from a different embedder, `build_app` builds it in memory from the corpus.
+3. `build_app` connects the LLM, `LLMRouter` with the `CentroidRouter` fallback, the tutor, the auth service and the speech provider.
+4. The CLI reads `--env-file` (default `.env`), then `Settings.from_env()`, then runs the subcommand.
+5. The Streamlit UI shows the login form until the session is valid, then the pages `Chat`, `My dashboard` and `Class overview` (instructors only).
+
+| Command | What it does |
+|---|---|
+| `studybuddy init [--password P]` | Make the database, the demo users and the index. Print the demo password one time |
+| `studybuddy ingest` | Build the index again from the corpus and save it |
+| `studybuddy ask -u USER QUESTION...` | Start a session, ask one question, end the session. The password comes from `STUDYBUDDY_PASSWORD` or a prompt |
+| `studybuddy eval [--eval-set F] [--k N] [--router llm\|centroid] [--json]` | Run the evaluation harness |
+| `studybuddy purge-logs` | Apply the retention policy to `query_log` |
+| `studybuddy ui [-- STREAMLIT OPTIONS]` | Start the Streamlit app (needs the `ui` extra) |
+
+**Rules**
+
+- A CLI error prints `error: <message>` on standard error, and the exit code is 1.
+- `load_dotenv` does not replace a variable that is already in the environment, and it skips empty values.
+- The UI keeps only the session token in the Streamlit session state.
+
+---
+
+## 13. The evaluation harness
+
+**Purpose.** Measure the router, the retrieval and the citation rate on a labelled question set.
+
+| Input | Output |
+|---|---|
+| `eval_set.jsonl`: `question`, `subject`, `source_id`, `section` | `EvalReport`: `n`, `router_accuracy`, `confusion`, `recall_at_k`, `mrr`, `k`, `citation_rate` |
+
+**Procedure**
+
+1. `studybuddy eval` builds the index from the corpus. It does not use the saved index.
+2. For each item, the router gives a subject. The harness compares it with the gold subject.
+3. For each item with a `source_id`, the harness searches the gold subject with `k` chunks.
+4. A hit is the first chunk with the same `source_id` and, if given, the same `section`.
+5. The harness adds `1 / rank` of the hit to the MRR total.
+6. With a tutor, the harness also asks the question and counts grounded answers.
+
+**Rules**
+
+- An empty set or a line without `question` or `subject` causes an error with the line number.
+- The default `--k` is 4. The default router is `llm` (the configured LLM with the centroid fallback).
+
+---
+
+## 14. The safety and privacy model
+
+| Rule | Value | Where |
+|---|---|---|
+| Subject labels | `arts`, `mathematics`, `science`, `general` | `subjects.py` |
+| Router retries before fallback | 1 (2 LLM calls) | `LLMRouter(retries=1)` |
+| Centroid threshold for `general` | cosine `< 0.08` | `CentroidRouter.min_similarity` |
+| Minimum chunk score | `0.05` | `STUDYBUDDY_MIN_SCORE` |
+| Minimum score for a `general` question | `0.25` | `Tutor.general_min_score` |
+| Hybrid weights | 0.6 dense, 0.4 BM25 | `HybridIndex.dense_weight` |
+| Chunk size and overlap | 120 words, 1 sentence | `chunk_document` |
+| Password length | 8 characters or more | `MIN_PASSWORD_LENGTH` |
+| Password hash | scrypt, `N = 2^14`, `r = 8`, `p = 1`, 16-byte salt | `hash_password` |
+| Session token | 32 random bytes, stored as SHA-256 | `AuthService.login` |
+| Session lifetime | 60 minutes | `STUDYBUDDY_SESSION_TTL_MINUTES` |
+| Minimum group for shared numbers | 3 | `STUDYBUDDY_K_ANONYMITY` |
+| Query-log retention | 180 days | `STUDYBUDDY_LOG_RETENTION_DAYS` |
+
+| Answer kind | When | What the student sees |
+|---|---|---|
+| `greeting` | The question matches the greeting list | A fixed greeting. Nothing is recorded |
+| `grounded` | At least one valid `[n]` citation | The answer and the list of cited sources |
+| `ungrounded` | No chunk, or no valid citation | The answer and the text `not grounded in the study material` |
+
+| Role | Can see |
+|---|---|
+| `student` | Own grades, own questions, own dashboard, k-anonymous averages of own courses |
+| `instructor` | Everything a student sees for own data, plus `Class overview` with k-anonymous aggregates only |
+
+---
+
+## 15. Data and file map
+
+| Path | Committed? | Contents |
+|---|---|---|
+| `src/studybuddy_rag/data/corpus/*.md` | Yes | 5 sample documents written for this project (CC BY 4.0) |
+| `src/studybuddy_rag/data/eval_set.jsonl` | Yes | 23 labelled questions |
+| `data/studybuddy.db` | No (git ignores it) | Tables `users`, `sessions`, `courses`, `grades`, `query_log`, `schema_version`, `chunks`, `index_meta` |
+| `.env` | No (git ignores it) | Local settings and API keys |
+| `.env.example` | Yes | All 18 environment variables, empty |
+| `*.pdf`, `*.wav`, `*.webm`, `/textbooks/`, `/index/` | No (git ignores them) | Local books and recordings |
+
+The `query_log` table has these columns: `user_id`, `asked_at`, `input_mode` (`text` or `voice`), `question`, `subject`, `route_method`, `answer`, `citations` (JSON) and `grounded`.
+
+---
+
+## 16. How to run studybuddy-rag
+
+### 16.1 Prerequisites
+
+| Need | For |
+|---|---|
+| Python 3.10+ | All components (CI uses 3.11) |
+| `streamlit>=1.40` (extra `ui`) | The user interface |
+| `sentence-transformers>=3.0` (extra `embeddings`) | Semantic vectors |
+| `pymupdf>=1.24` (extra `pdf`) | The `parse_pdf` function |
+| A Gemini key or an OpenAI-compatible server | A real LLM (optional) |
+
+### 16.2 Installation
 
 ```bash
-pytest -q
+git clone https://github.com/KrishnaAnnavaram/studybuddy-rag.git
+cd studybuddy-rag
+python -m venv .venv
+. .venv/bin/activate            # Windows: .venv\Scripts\activate
+pip install -e ".[dev,ui]"
+cp .env.example .env            # optional: empty values keep the offline mode
 ```
 
-The 54 tests cover the router's strict parsing and fallback, the decimal-safe splitter and chunk overlap, top-k subject-filtered retrieval and index persistence, citation validation and ungrounded answers, password hashing, session expiry and logout, per-student data isolation, the correct "you" on the dashboard, k-anonymous aggregates, the single summary function, retention, the voice path, configuration and the CLI. They all use the deterministic fakes and need no network or keys.
+### 16.3 Run studybuddy-rag
 
-## Roadmap
+Offline demo (no key, no network):
 
-- [x] **M1:** auth with hashed passwords, sessions, roles, SQLite schema and privacy-scoped analytics
-- [x] **M2:** ingestion (Markdown, optional PDF), chunking and a persistent hybrid index
-- [x] **M3:** strict router, RAG with validated citations, and an evaluation harness
-- [x] **M4:** Streamlit chat (text and browser voice) plus student and instructor dashboards
-- [ ] **M5:** cross-encoder reranking and answer-faithfulness scoring (LLM-as-judge)
-- [ ] **M6:** FastAPI backend with JWT, Alembic migrations and argon2 hashes
-- [ ] **M7:** ingest a full open-licensed textbook set (e.g. OpenStax) with page-level citations
+```bash
+studybuddy init --password demo-pass-123        # database, 5 demo users, 22 chunks
+STUDYBUDDY_PASSWORD=demo-pass-123 studybuddy ask -u student_a "How do I add 1/3 and 1/4?"
+studybuddy eval                                 # router accuracy, recall@4, MRR, citation rate
+studybuddy eval --router centroid --json
+studybuddy purge-logs
+studybuddy ui                                   # http://localhost:8501
+studybuddy ui -- --server.port 8502             # Streamlit options after --
+```
 
-## Limitations
+With a real model:
 
-- The bundled corpus is a tiny sample written for this demo. It is not a curriculum. Use open-licensed books for real use.
-- The offline `hashing` embedder is lexical. Use `sentence-transformers` for semantic matching.
-- The fake LLM is extractive and exists for tests and demos. Answer quality depends on the configured model.
-- Citation checks verify that a cited source exists, not that the claim is entailed by it.
-- SQLite and Streamlit suit a single-server demo. Multi-user production needs the M6 backend.
+```bash
+# .env
+STUDYBUDDY_LLM_PROVIDER=gemini
+GEMINI_API_KEY=<your key>
+STUDYBUDDY_EMBEDDING_PROVIDER=sentence-transformers   # needs: pip install -e ".[embeddings]"
 
-## License
+studybuddy ingest        # build the index again for the new embedder
+```
 
-MIT © 2026 Krishna Annavaram. See [LICENSE](LICENSE).
+If you change the embedder, run `studybuddy ingest`. Otherwise the app builds the index in memory at each start.
+
+### 16.4 Environment variables
+
+| Variable | Used by | Meaning |
+|---|---|---|
+| `STUDYBUDDY_DB_PATH` | All | SQLite file. Default `data/studybuddy.db` |
+| `STUDYBUDDY_CORPUS_DIR` | Ingestion | Folder of `.md` documents. Default: the bundled corpus |
+| `STUDYBUDDY_LLM_PROVIDER` | Providers | `fake` (default), `gemini` or `openai` |
+| `STUDYBUDDY_LLM_MODEL` | Providers | Model ID. Default `gemini-2.5-flash` or `gpt-4o-mini` |
+| `STUDYBUDDY_LLM_BASE_URL` | Providers | LLM base URL. Default: the provider URL |
+| `STUDYBUDDY_EMBEDDING_PROVIDER` | Index | `hashing` (default) or `sentence-transformers` |
+| `STUDYBUDDY_EMBEDDING_MODEL` | Index | Default `all-MiniLM-L6-v2` |
+| `STUDYBUDDY_SPEECH_PROVIDER` | Voice | `none` (default), `fake` or `openai` |
+| `STUDYBUDDY_SPEECH_MODEL` | Voice | Default `whisper-1` |
+| `STUDYBUDDY_TOP_K` | Tutor | Chunks for each question. Default 4, minimum 1 |
+| `STUDYBUDDY_MIN_SCORE` | Tutor | Minimum hybrid score. Default 0.05 |
+| `STUDYBUDDY_SESSION_TTL_MINUTES` | Auth | Session lifetime. Default 60, minimum 1 |
+| `STUDYBUDDY_LOG_RETENTION_DAYS` | `purge-logs` | Retention of `query_log`. Default 180 |
+| `STUDYBUDDY_K_ANONYMITY` | Analytics | Minimum group size. Default 3, minimum 1 |
+| `STUDYBUDDY_DEMO_PASSWORD` | `init` | Demo password. Default: random, printed one time |
+| `STUDYBUDDY_PASSWORD` | `ask` | Password for `ask`. If empty, the CLI asks for it |
+| `GEMINI_API_KEY` | Providers | Necessary for `STUDYBUDDY_LLM_PROVIDER=gemini` |
+| `OPENAI_API_KEY` | Providers, voice | Necessary for the hosted OpenAI LLM and for `openai` speech |
+
+A value that is not a number for a number variable causes an error at start. An unknown provider name also causes an error.
+Credentials are only in a local `.env` file. Git ignores this file. Do not print or commit credentials.
+
+---
+
+## 17. How to extend studybuddy-rag
+
+| You want to… | Do this | Code change? |
+|---|---|---|
+| Use your own study material | Put `.md` files with a `title` and `subject` header in a folder. Set `STUDYBUDDY_CORPUS_DIR`. Run `studybuddy ingest` | No |
+| Use a local LLM | Set `STUDYBUDDY_LLM_PROVIDER=openai` and `STUDYBUDDY_LLM_BASE_URL=http://localhost:11434/v1` | No |
+| Add a subject | Add a member to `Subject` in `subjects.py`, add documents, and add questions to `eval_set.jsonl` | Small |
+| Add PDF books to the corpus | Call `parse_pdf` from `load_corpus` for `*.pdf` files, with a subject for each file | Small |
+| Add an LLM provider | Make a class with `name` and `complete(...)`, and add it to `build_llm` and `Settings` | Small |
+| Use a local Whisper server | Add a base URL setting and pass it to `OpenAITranscriber` | Small |
+| Add reranking | Rerank the result of `HybridIndex.search` in `Tutor.retrieve` | Yes |
+
+Planned milestones (not built):
+
+- **M5:** a cross-encoder reranker and an answer faithfulness score with an LLM judge.
+- **M6:** a FastAPI back end with JWT, Alembic migrations and argon2 hashes.
+- **M7:** a full open-licensed textbook set with page-level citations.
+
+---
+
+## 18. Validation results
+
+| Validation | Result | Command |
+|---|---|---|
+| Unit tests | **55 passed** | `pytest -q` |
+| Router accuracy, `llm` router with `FakeLLM` | 0.957 (22 of 23) | `studybuddy eval` |
+| Router accuracy, `centroid` router | 0.870 (20 of 23) | `studybuddy eval --router centroid` |
+| Retrieval recall@4 and MRR | 1.000 and 1.000 | `studybuddy eval` |
+| Answers with a valid citation | 1.0 | `studybuddy eval` |
+| CI | Python 3.11, `pytest -q` on each push | `.github/workflows/ci.yml` |
+
+These numbers come from the offline fakes on the bundled 23 questions. They prove that the pipeline is connected correctly. They do not measure the answer quality of a real model.
+With `FakeLLM`, the question "How do I add 1/3 and 1/4?" goes to `general`, because the fake classifier uses keywords. The `general` search still finds the correct chunk.
+
+---
+
+## 19. Known problems
+
+Read these problems before you use studybuddy-rag in production.
+
+| # | Area | Problem | Impact and action |
+|---|---|---|---|
+| 1 | Corpus | The bundled corpus has 5 short documents (1,319 words, 22 chunks). It is not a curriculum | Answers cover few topics. Use open-licensed books for real use |
+| 2 | Ingestion | `load_corpus` reads only `*.md` files. `parse_pdf` exists but no command calls it | PDF books need a small code change. See [17](#17-how-to-extend-studybuddy-rag) |
+| 3 | Citations | The check proves that a cited source exists, not that the source supports the claim | An answer can cite a source incorrectly. M5 plans a faithfulness score |
+| 4 | Offline mode | `FakeLLM` routes by keywords and gives extractive answers. The `hashing` embedder is lexical | Use a real LLM and `sentence-transformers` for real quality |
+| 5 | Voice | `OpenAITranscriber` always calls `api.openai.com`. No setting changes its base URL | A local Whisper server needs a small code change |
+| 6 | Index | If the embedder changes, `build_app` builds the index in memory at each start, with no warning | Run `studybuddy ingest` after each change of the embedder |
+| 7 | Sessions | The code deletes an expired session only when the token is used again. There is no login rate limit | Old session rows stay in the database. Add a rate limit before public use |
+| 8 | Privacy | With k = 3, a student in a course with 3 grades can calculate the sum of the 2 other grades | Set `STUDYBUDDY_K_ANONYMITY` higher for small classes |
+| 9 | Scale | SQLite and Streamlit share one connection in one process | Good for one server. M6 plans a FastAPI back end |
+| 10 | Tuning | The weights 0.6 and 0.4, the `general` threshold 0.25 and the chunk size are constants | Change them in code. No environment variable controls them |
+
+---
+
+## 20. Key points
+
+1. **The router narrows retrieval and never disables it.** A wrong subject falls back to a search of all subjects, with a note.
+2. **The classifier reply is strict.** Only a JSON object with a valid label and confidence is accepted. Other replies go to the centroid fallback.
+3. **Each citation must point to a real source.** The tutor removes invalid citations and marks an answer without a valid citation as `ungrounded`.
+4. **Each call starts with a session check.** The service authenticates the token before it does work, also before a speech call.
+5. **Each student sees only own data.** Shared numbers are k-anonymous, and the instructor sees aggregates only.
+6. **The full demo runs offline.** The core has no third-party dependencies, and all 55 tests run without network or keys.
+
+---
+
+## 21. Glossary
+
+| Term | Meaning |
+|---|---|
+| **Aggregate** | A count or an average over a group of students, shown only when the group has at least k members |
+| **BM25** | A word-frequency score for a chunk against a question |
+| **Centroid** | The mean vector of all chunks of one subject |
+| **Chunk** | A group of whole sentences from one section, with at most 120 words |
+| **Citation** | A `[n]` mark in an answer that points to source number n |
+| **Corpus** | The folder of Markdown documents that contains the study material |
+| **Embedder** | A provider that changes a text into a normalised vector |
+| **Fake** | A deterministic offline provider for tests and the demo |
+| **Grounded answer** | An answer with at least one valid citation |
+| **Hybrid score** | `0.6 × dense cosine + 0.4 × normalised BM25` |
+| **Index** | The chunks, their vectors and the BM25 statistics, saved in SQLite |
+| **k-anonymity threshold** | The minimum group size k for a shared number |
+| **Principal** | The authenticated user: ID, user name, display name and role |
+| **Provider** | An LLM, an embedder or a speech-to-text service behind an interface |
+| **Query log** | The `query_log` table with one row for each question that is not a greeting |
+| **Route decision** | The subject, confidence, method and detail that the router gives |
+| **Session** | A login with a token and an expiry time |
+| **Source** | One retrieved chunk, with a number in the answer prompt |
+| **Subject** | One label from `arts`, `mathematics`, `science` and `general` |
+| **Ungrounded answer** | An answer with no valid citation, or with no retrieved chunk |
+
+---
+
+## 22. License
+
+[MIT](LICENSE) © 2026 Krishna Annavaram

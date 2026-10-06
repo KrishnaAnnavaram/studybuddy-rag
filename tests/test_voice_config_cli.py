@@ -96,3 +96,14 @@ def test_cli_bad_password_returns_error(tmp_path, monkeypatch, capsys):
     monkeypatch.setenv("STUDYBUDDY_PASSWORD", "wrong-password")
     assert main(["--env-file", "none.env", "ask", "-u", "student_a", "hello?"]) == 1
     assert "invalid username or password" in capsys.readouterr().err
+
+
+def test_cli_ui_passes_streamlit_options_after_the_separator(monkeypatch):
+    calls = []
+    monkeypatch.setattr("studybuddy_rag.cli.subprocess.call", lambda cmd: calls.append(cmd) or 0)
+    assert main(["--env-file", "none.env", "ui", "--", "--server.port", "8502"]) == 0
+    assert main(["--env-file", "none.env", "ui"]) == 0
+    first, second = calls
+    assert first[2:4] == ["streamlit", "run"] and first[-2:] == ["--server.port", "8502"]
+    assert "--" not in first
+    assert second[-1].endswith("streamlit_app.py")

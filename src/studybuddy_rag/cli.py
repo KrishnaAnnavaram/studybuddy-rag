@@ -89,9 +89,14 @@ def _cmd_purge(settings: Settings, args: argparse.Namespace) -> int:
     return 0
 
 
-def _cmd_ui(settings: Settings, args: argparse.Namespace) -> int:  # pragma: no cover - launches a server
+def _cmd_ui(settings: Settings, args: argparse.Namespace) -> int:
     app_path = Path(__file__).parent / "app" / "streamlit_app.py"
-    return subprocess.call([sys.executable, "-m", "streamlit", "run", str(app_path), *args.streamlit_args])
+    extra = list(args.streamlit_args)
+    if extra[:1] == ["--"]:
+        # `studybuddy ui -- --server.port 8502`: the separator is for argparse. Streamlit would pass
+        # everything after a `--` to the script instead of reading it as its own options.
+        extra = extra[1:]
+    return subprocess.call([sys.executable, "-m", "streamlit", "run", str(app_path), *extra])
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -121,7 +126,7 @@ def build_parser() -> argparse.ArgumentParser:
     s = sub.add_parser("purge-logs", help="apply the query-log retention policy")
     s.set_defaults(func=_cmd_purge)
 
-    s = sub.add_parser("ui", help="launch the Streamlit app (needs the 'ui' extra)")
+    s = sub.add_parser("ui", help="launch the Streamlit app (needs the 'ui' extra), e.g. ui -- --server.port 8502")
     s.add_argument("streamlit_args", nargs=argparse.REMAINDER)
     s.set_defaults(func=_cmd_ui)
     return p
